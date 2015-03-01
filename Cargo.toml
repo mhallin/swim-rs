@@ -1,0 +1,19 @@
+[package]
+
+name = "swim"
+version = "0.0.1"
+authors = ["mhallin <mhallin@gmail.com>"]
+
+[lib]
+name = "swim"
+
+[[bin]]
+name = "swimmer"
+
+[dependencies]
+docopt = "*"
+rustc-serialize = "*"
+docopt_macros = "*"
+uuid = "*"
+time = "*"
+rand = "*"
