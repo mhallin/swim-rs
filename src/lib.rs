@@ -53,8 +53,9 @@ struct EncSocketAddr {
 #[derive(RustcEncodable, RustcDecodable, Debug, Clone)]
 enum Request {
     Ping,
-    PingRequest(EncSocketAddr),
     Ack,
+    PingRequest(EncSocketAddr),
+    AckHost(Member),
 }
 
 #[derive(Debug, Clone)]
@@ -307,8 +308,6 @@ fn send_ping_requests(state: &State, target: &Member, request_tx: &Sender<Target
     rand::thread_rng().shuffle(&mut possible_members);
 
     for relay in possible_members.iter().take(3) {
-        println!("Sending indirect ping through {:?}", relay);
-
         request_tx.send(TargetedRequest {
             request: Request::PingRequest(EncSocketAddr::from_addr(&target.remote_host.unwrap())),
             target: relay.remote_host.unwrap(),
@@ -356,15 +355,20 @@ fn process_internal_request(state: &mut State, message: InternalRequest, event_t
 
                 let response = match message.request {
                     Ping => Some(TargetedRequest { request: Ack, target: src_addr }),
+                    Ack => {
+                        ack_response(state, src_addr);
+                        mark_node_alive(state, src_addr, event_tx, request_tx);
+                        None
+                    },
                     PingRequest(dest_addr) => {
                         add_to_wait_list(state, &dest_addr.addr, &src_addr);
                         Some(TargetedRequest { request: Ping, target: dest_addr.addr })
                     },
-                    Ack => {
-                        ack_response(state, src_addr);
-                        mark_node_alive(state, src_addr, event_tx);
+                    AckHost(member) => {
+                        ack_response(state, member.remote_host.unwrap());
+                        mark_node_alive(state, member.remote_host.unwrap(), event_tx, request_tx);
                         None
-                    },
+                    }
                 };
 
                 match response {
@@ -422,7 +426,7 @@ fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, event_tx: &Sen
     send_member_list_event(state.members.clone(), event_tx, MemberListEvent::MemberJoined(new_member));
 }
 
-fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<(Vec<Member>, MemberListEvent)>) {
+fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<(Vec<Member>, MemberListEvent)>, request_tx: &Sender<TargetedRequest>) {
     let mut found_member = None;
 
     for mut member in state.members.iter_mut() {
@@ -435,8 +439,16 @@ fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<(V
         }
     }
 
-    if found_member.is_some() {
-        let member = found_member.unwrap();
+    if let Some(member) = found_member {
+        match state.wait_list.get_mut(&src_addr) {
+            Some(mut wait_list) => {
+                for remote in wait_list.drain() {
+                    request_tx.send(TargetedRequest { request: Request::AckHost(member.clone()), target: remote }).unwrap();
+                }
+            },
+            None => ()
+        };
+
         enqueue_state_change(state, &[member.clone()]);
         send_member_list_event(state.members.clone(), event_tx, MemberListEvent::MemberWentUp(member.clone()));
     }
