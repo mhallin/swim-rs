@@ -3,6 +3,7 @@ use std::fmt::{Debug, Formatter};
 use std::old_io::net::ip::SocketAddr;
 use std::str::FromStr;
 use std::cmp::Ordering;
+use std::time::Duration;
 
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use time;
@@ -21,10 +22,75 @@ pub struct Member {
     pub host_key: Uuid,
     pub remote_host: Option<SocketAddr>,
     pub incarnation: u64,
-    pub member_state: MemberState,
-    pub last_state_change: time::Tm,
+
+    member_state: MemberState,
+    last_state_change: time::Tm,
 }
 
+#[derive(RustcEncodable, RustcDecodable, Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+pub struct StateChange {
+    member: Member,
+}
+
+impl Member {
+    pub fn new(host_key: Uuid, remote_host: SocketAddr, incarnation: u64, known_state: MemberState) -> Self {
+        Member {
+            host_key: host_key, remote_host: Some(remote_host), incarnation: incarnation,
+            member_state: known_state, last_state_change: time::now_utc(),
+        }
+    }
+
+    pub fn myself(host_key: Uuid) -> Self {
+        Member {
+            host_key: host_key, remote_host: None, incarnation: 0,
+            member_state: MemberState::Alive, last_state_change: time::now_utc(),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.remote_host.is_some()
+    }
+
+    pub fn is_myself(&self) -> bool {
+        self.remote_host.is_none()
+    }
+
+    pub fn state_change_older_than(&self, duration: Duration) -> bool {
+        self.last_state_change + duration < time::now_utc()
+    }
+
+    pub fn state(&self) -> MemberState {
+        self.member_state
+    }
+
+    pub fn set_state(&mut self, state: MemberState) {
+        if self.member_state != state {
+            self.member_state = state;
+            self.last_state_change = time::now_utc();
+        }
+    }
+
+    pub fn member_by_changing_host(&self, remote_host: SocketAddr) -> Member {
+        Member {
+            remote_host: Some(remote_host),
+            .. self.clone()
+        }
+    }
+}
+
+impl StateChange {
+    pub fn new(member: Member) -> StateChange {
+        StateChange { member: member }
+    }
+
+    pub fn member(&self) -> &Member {
+        &self.member
+    }
+
+    pub fn update(&mut self, member: Member) {
+        self.member = member
+    }
+}
 
 impl Decodable for Member {
     fn decode<D: Decoder>(d: &mut D) -> Result<Self, D::Error> {
