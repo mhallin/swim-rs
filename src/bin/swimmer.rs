@@ -30,15 +30,15 @@ fn main() {
     println!("Swimmer main: {:?}", args);
     println!("Host key: {}", host_key.to_hyphenated_string());
 
-    let member_list = swim::start_member_list(
+    let cluster = swim::start_cluster(
         host_key, args.arg_cluster_key.as_slice(), args.arg_listen_addr.as_slice());
 
     if args.arg_seed_node.len() > 0 {
-        member_list.add_seed_node(args.arg_seed_node.as_slice());
+        cluster.add_seed_node(args.arg_seed_node.as_slice());
     }
 
     println!("Starting event poller");
-    for (members, event) in member_list.events.iter() {
+    for (members, event) in cluster.events.iter() {
         println!("");
         println!(" CLUSTER EVENT ");
         println!("===============");
