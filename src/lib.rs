@@ -75,6 +75,8 @@ struct State {
     state_changes: Vec<StateChange>,
     wait_list: HashMap<SocketAddr, Vec<SocketAddr>>,
     socket: UdpSocket,
+    request_tx: Sender<TargetedRequest>,
+    event_tx: Sender<ClusterEvent>,
 }
 
 #[derive(RustcEncodable, RustcDecodable, Debug, Clone)]
@@ -106,6 +108,8 @@ pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_
             state_changes: vec![StateChange::new(me)],
             wait_list: HashMap::new(),
             socket: worker_socket,
+            request_tx: timeout_tx,
+            event_tx: event_tx,
         };
 
         let mut timer = Timer::new().unwrap();
@@ -114,15 +118,15 @@ pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_
         loop {
             select!(
                 _ = periodic.recv() => {
-                    enqueue_seed_nodes(&state.seed_queue, &timeout_tx);
-                    enqueue_random_ping(&mut state, &timeout_tx);
+                    enqueue_seed_nodes(&state.seed_queue, &state.request_tx);
+                    enqueue_random_ping(&mut state);
                 },
                 request = request_rx.recv() => {
-                    prune_timed_out_responses(&mut state, &event_tx, &timeout_tx);
+                    prune_timed_out_responses(&mut state);
                     process_request(&mut state, request.unwrap());
                 },
                 internal_message = internal_rx.recv() => {
-                    process_internal_request(&mut state, internal_message.unwrap(), &event_tx, &timeout_tx);
+                    process_internal_request(&mut state, internal_message.unwrap());
                 }
             );
         }
@@ -204,13 +208,13 @@ fn enqueue_seed_nodes(seed_nodes: &[SocketAddr], tx: &Sender<TargetedRequest>) {
     }
 }
 
-fn enqueue_random_ping(state: &mut State, tx: &Sender<TargetedRequest>) {
+fn enqueue_random_ping(state: &mut State) {
     if let Some(member) = state.members.next_random_member() {
-        tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host().unwrap() }).unwrap();
+        state.request_tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host().unwrap() }).unwrap();
     }
 }
 
-fn prune_timed_out_responses(state: &mut State, event_tx: &Sender<ClusterEvent>, request_tx: &Sender<TargetedRequest>) {
+fn prune_timed_out_responses(state: &mut State) {
     let now = time::now_utc();
 
     let (remaining, expired): (Vec<_>, Vec<_>) = state.pending_responses
@@ -231,19 +235,19 @@ fn prune_timed_out_responses(state: &mut State, event_tx: &Sender<ClusterEvent>,
     enqueue_state_change(state, suspect.as_slice());
 
     for member in suspect {
-        send_ping_requests(state, &member, request_tx);
-        send_member_event(&state.members, event_tx, MemberEvent::MemberSuspectedDown(member.clone()));
+        send_ping_requests(state, &member);
+        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberSuspectedDown(member.clone()));
     }
 
     for member in down {
-        send_member_event(&state.members, event_tx, MemberEvent::MemberWentDown(member.clone()));
+        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberWentDown(member.clone()));
     }
 }
 
-fn send_ping_requests(state: &State, target: &Member, request_tx: &Sender<TargetedRequest>) {
+fn send_ping_requests(state: &State, target: &Member) {
     if let Some(target_host) = target.remote_host() {
         for relay in state.members.hosts_for_indirect_ping(&target_host) {
-            request_tx.send(TargetedRequest {
+            state.request_tx.send(TargetedRequest {
                 request: Request::PingRequest(EncSocketAddr::from_addr(&target_host)),
                 target: relay,
             }).unwrap();
@@ -264,7 +268,7 @@ fn send_member_event(members: &MemberList, event_tx: &Sender<ClusterEvent>, even
     event_tx.send((members.to_vec(), event)).unwrap();
 }
 
-fn process_internal_request(state: &mut State, message: InternalRequest, event_tx: &Sender<ClusterEvent>, request_tx: &Sender<TargetedRequest>) {
+fn process_internal_request(state: &mut State, message: InternalRequest) {
     use InternalRequest::*;
     use Request::*;
 
@@ -277,16 +281,16 @@ fn process_internal_request(state: &mut State, message: InternalRequest, event_t
                 println!("ERROR: Mismatching cluster keys, ignoring message");
             }
             else {
-                apply_state_changes(state, message.state_changes, src_addr, event_tx);
+                apply_state_changes(state, message.state_changes, src_addr);
                 remove_potential_seed(state, src_addr);
 
-                ensure_node_is_member(state, src_addr, event_tx, message.sender);
+                ensure_node_is_member(state, src_addr, message.sender);
 
                 let response = match message.request {
                     Ping => Some(TargetedRequest { request: Ack, target: src_addr }),
                     Ack => {
                         ack_response(state, src_addr);
-                        mark_node_alive(state, src_addr, event_tx, request_tx);
+                        mark_node_alive(state, src_addr);
                         None
                     },
                     PingRequest(dest_addr) => {
@@ -296,13 +300,13 @@ fn process_internal_request(state: &mut State, message: InternalRequest, event_t
                     },
                     AckHost(member) => {
                         ack_response(state, member.remote_host().unwrap());
-                        mark_node_alive(state, member.remote_host().unwrap(), event_tx, request_tx);
+                        mark_node_alive(state, member.remote_host().unwrap());
                         None
                     }
                 };
 
                 match response {
-                    Some(response) => request_tx.send(response).unwrap(),
+                    Some(response) => state.request_tx.send(response).unwrap(),
                     None => (),
                 };
             }
@@ -338,7 +342,7 @@ fn ack_response(state: &mut State, src_addr: SocketAddr) {
     state.pending_responses.retain(|op| !to_remove.iter().any(|ip| ip == op));
 }
 
-fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<ClusterEvent>, sender: Uuid) {
+fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, sender: Uuid) {
     if state.members.has_member(&src_addr) {
         return;
     }
@@ -347,38 +351,37 @@ fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, event_tx: &Sen
 
     state.members.add_member(new_member.clone());
     enqueue_state_change(state, &[new_member.clone()]);
-    send_member_event(&state.members, event_tx, MemberEvent::MemberJoined(new_member));
+    send_member_event(&state.members, &state.event_tx, MemberEvent::MemberJoined(new_member));
 }
 
-fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<ClusterEvent>, request_tx: &Sender<TargetedRequest>) {
+fn mark_node_alive(state: &mut State, src_addr: SocketAddr) {
     if let Some(member) = state.members.mark_node_alive(&src_addr) {
         match state.wait_list.get_mut(&src_addr) {
             Some(mut wait_list) => {
                 for remote in wait_list.drain() {
-                    request_tx.send(TargetedRequest { request: Request::AckHost(member.clone()), target: remote }).unwrap();
+                    state.request_tx.send(TargetedRequest { request: Request::AckHost(member.clone()), target: remote }).unwrap();
                 }
             },
             None => ()
         };
 
         enqueue_state_change(state, &[member.clone()]);
-        send_member_event(&state.members, event_tx, MemberEvent::MemberWentUp(member.clone()));
+        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberWentUp(member.clone()));
     }
 }
 
-fn apply_state_changes(state: &mut State, state_changes: Vec<StateChange>, from: SocketAddr, event_tx: &Sender<ClusterEvent>) {
+fn apply_state_changes(state: &mut State, state_changes: Vec<StateChange>, from: SocketAddr) {
     let (new, changed) = state.members.apply_state_changes(state_changes, &from);
 
     enqueue_state_change(state, new.as_slice());
     enqueue_state_change(state, changed.as_slice());
 
     for member in new {
-
-        send_member_event(&state.members, event_tx, MemberEvent::MemberJoined(member));
+        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberJoined(member));
     }
 
     for member in changed {
-        send_member_event(&state.members, event_tx, determine_member_event(member));
+        send_member_event(&state.members, &state.event_tx, determine_member_event(member));
     }
 }
 
