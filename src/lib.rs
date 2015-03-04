@@ -42,9 +42,7 @@ pub struct Cluster {
 }
 
 #[derive(Debug, Clone)]
-struct EncSocketAddr {
-    addr: SocketAddr,
-}
+struct EncSocketAddr(SocketAddr);
 
 #[derive(RustcEncodable, RustcDecodable, Debug, Clone)]
 enum Request {
@@ -290,8 +288,9 @@ fn process_internal_request(state: &mut State, message: InternalRequest, event_t
                         None
                     },
                     PingRequest(dest_addr) => {
-                        add_to_wait_list(state, &dest_addr.addr, &src_addr);
-                        Some(TargetedRequest { request: Ping, target: dest_addr.addr })
+                        let EncSocketAddr(dest_addr) = dest_addr;
+                        add_to_wait_list(state, &dest_addr, &src_addr);
+                        Some(TargetedRequest { request: Ping, target: dest_addr })
                     },
                     AckHost(member) => {
                         ack_response(state, member.remote_host().unwrap());
@@ -409,7 +408,7 @@ impl Decodable for EncSocketAddr {
     fn decode<D: Decoder>(d: &mut D) -> Result<Self, D::Error> {
         match d.read_str() {
             Ok(s) => match FromStr::from_str(s.as_slice()) {
-                Ok(addr) => Ok(EncSocketAddr { addr: addr }),
+                Ok(addr) => Ok(EncSocketAddr(addr)),
                 Err(e) => Err(d.error(format!("{:?}", e).as_slice())),
             },
             Err(e) => Err(e),
@@ -419,12 +418,13 @@ impl Decodable for EncSocketAddr {
 
 impl Encodable for EncSocketAddr {
     fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
-        format!("{}", self.addr).encode(e)
+        let &EncSocketAddr(addr) = self;
+        format!("{}", addr).encode(e)
     }
 }
 
 impl EncSocketAddr {
     fn from_addr(addr: &SocketAddr) -> Self {
-        EncSocketAddr { addr: addr.clone() }
+        EncSocketAddr(addr.clone())
     }
 }
