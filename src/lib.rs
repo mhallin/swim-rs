@@ -28,8 +28,10 @@ mod memberlist;
 use member::{Member, MemberState, StateChange};
 use memberlist::MemberList;
 
+pub type ClusterEvent = (Vec<Member>, MemberEvent);
+
 #[derive(Debug)]
-pub enum ClusterEvent {
+pub enum MemberEvent {
     MemberJoined(Member),
     MemberWentUp(Member),
     MemberSuspectedDown(Member),
@@ -37,7 +39,7 @@ pub enum ClusterEvent {
 }
 
 pub struct Cluster {
-    pub events: Receiver<(Vec<Member>, ClusterEvent)>,
+    pub events: Receiver<ClusterEvent>,
     comm: Sender<InternalRequest>,
 }
 
@@ -208,7 +210,7 @@ fn enqueue_random_ping(state: &mut State, tx: &Sender<TargetedRequest>) {
     }
 }
 
-fn prune_timed_out_responses(state: &mut State, event_tx: &Sender<(Vec<Member>, ClusterEvent)>, request_tx: &Sender<TargetedRequest>) {
+fn prune_timed_out_responses(state: &mut State, event_tx: &Sender<ClusterEvent>, request_tx: &Sender<TargetedRequest>) {
     let now = time::now_utc();
 
     let (remaining, expired): (Vec<_>, Vec<_>) = state.pending_responses
@@ -230,11 +232,11 @@ fn prune_timed_out_responses(state: &mut State, event_tx: &Sender<(Vec<Member>, 
 
     for member in suspect {
         send_ping_requests(state, &member, request_tx);
-        send_cluster_event(&state.members, event_tx, ClusterEvent::MemberSuspectedDown(member.clone()));
+        send_member_event(&state.members, event_tx, MemberEvent::MemberSuspectedDown(member.clone()));
     }
 
     for member in down {
-        send_cluster_event(&state.members, event_tx, ClusterEvent::MemberWentDown(member.clone()));
+        send_member_event(&state.members, event_tx, MemberEvent::MemberWentDown(member.clone()));
     }
 }
 
@@ -249,8 +251,8 @@ fn send_ping_requests(state: &State, target: &Member, request_tx: &Sender<Target
     }
 }
 
-fn send_cluster_event(members: &MemberList, event_tx: &Sender<(Vec<Member>, ClusterEvent)>, event: ClusterEvent) {
-    use ClusterEvent::*;
+fn send_member_event(members: &MemberList, event_tx: &Sender<ClusterEvent>, event: MemberEvent) {
+    use MemberEvent::*;
 
     match event {
         MemberJoined(_) => {},
@@ -262,7 +264,7 @@ fn send_cluster_event(members: &MemberList, event_tx: &Sender<(Vec<Member>, Clus
     event_tx.send((members.to_vec(), event)).unwrap();
 }
 
-fn process_internal_request(state: &mut State, message: InternalRequest, event_tx: &Sender<(Vec<Member>, ClusterEvent)>, request_tx: &Sender<TargetedRequest>) {
+fn process_internal_request(state: &mut State, message: InternalRequest, event_tx: &Sender<ClusterEvent>, request_tx: &Sender<TargetedRequest>) {
     use InternalRequest::*;
     use Request::*;
 
@@ -336,7 +338,7 @@ fn ack_response(state: &mut State, src_addr: SocketAddr) {
     state.pending_responses.retain(|op| !to_remove.iter().any(|ip| ip == op));
 }
 
-fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<(Vec<Member>, ClusterEvent)>, sender: Uuid) {
+fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<ClusterEvent>, sender: Uuid) {
     if state.members.has_member(&src_addr) {
         return;
     }
@@ -345,10 +347,10 @@ fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, event_tx: &Sen
 
     state.members.add_member(new_member.clone());
     enqueue_state_change(state, &[new_member.clone()]);
-    send_cluster_event(&state.members, event_tx, ClusterEvent::MemberJoined(new_member));
+    send_member_event(&state.members, event_tx, MemberEvent::MemberJoined(new_member));
 }
 
-fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<(Vec<Member>, ClusterEvent)>, request_tx: &Sender<TargetedRequest>) {
+fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<ClusterEvent>, request_tx: &Sender<TargetedRequest>) {
     if let Some(member) = state.members.mark_node_alive(&src_addr) {
         match state.wait_list.get_mut(&src_addr) {
             Some(mut wait_list) => {
@@ -360,11 +362,11 @@ fn mark_node_alive(state: &mut State, src_addr: SocketAddr, event_tx: &Sender<(V
         };
 
         enqueue_state_change(state, &[member.clone()]);
-        send_cluster_event(&state.members, event_tx, ClusterEvent::MemberWentUp(member.clone()));
+        send_member_event(&state.members, event_tx, MemberEvent::MemberWentUp(member.clone()));
     }
 }
 
-fn apply_state_changes(state: &mut State, state_changes: Vec<StateChange>, from: SocketAddr, event_tx: &Sender<(Vec<Member>, ClusterEvent)>) {
+fn apply_state_changes(state: &mut State, state_changes: Vec<StateChange>, from: SocketAddr, event_tx: &Sender<ClusterEvent>) {
     let (new, changed) = state.members.apply_state_changes(state_changes, &from);
 
     enqueue_state_change(state, new.as_slice());
@@ -372,17 +374,17 @@ fn apply_state_changes(state: &mut State, state_changes: Vec<StateChange>, from:
 
     for member in new {
 
-        send_cluster_event(&state.members, event_tx, ClusterEvent::MemberJoined(member));
+        send_member_event(&state.members, event_tx, MemberEvent::MemberJoined(member));
     }
 
     for member in changed {
-        send_cluster_event(&state.members, event_tx, determine_cluster_event(member));
+        send_member_event(&state.members, event_tx, determine_member_event(member));
     }
 }
 
-fn determine_cluster_event(member: Member) -> ClusterEvent {
+fn determine_member_event(member: Member) -> MemberEvent {
     use member::MemberState::*;
-    use ClusterEvent::*;
+    use MemberEvent::*;
 
     return match member.state() {
         Alive => MemberWentUp(member),
