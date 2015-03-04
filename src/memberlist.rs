@@ -28,7 +28,7 @@ impl MemberList {
     }
 
     pub fn to_map(&self) -> HashMap<Uuid, Member> {
-        self.members.iter().map(|ref m| (m.host_key.clone(), (*m).clone())).collect()
+        self.members.iter().map(|ref m| (m.host_key().clone(), (*m).clone())).collect()
     }
 
     fn mut_myself(&mut self) -> &mut Member {
@@ -43,7 +43,7 @@ impl MemberList {
 
     pub fn reincarnate_self(&mut self) -> Member {
         let myself = self.mut_myself();
-        myself.incarnation += 1;
+        myself.reincarnate();
 
         myself.clone()
     }
@@ -69,7 +69,7 @@ impl MemberList {
         let mut down_members = Vec::new();
 
         for mut member in self.members.iter_mut() {
-            if let Some(remote_host) = member.remote_host {
+            if let Some(remote_host) = member.remote_host() {
                 if !expired_hosts.contains(&remote_host) {
                     continue;
                 }
@@ -90,7 +90,7 @@ impl MemberList {
 
     pub fn mark_node_alive(&mut self, src_addr: &SocketAddr) -> Option<Member> {
         for mut member in self.members.iter_mut() {
-            if member.remote_host == Some(*src_addr) && member.state() != MemberState::Alive {
+            if member.remote_host() == Some(*src_addr) && member.state() != MemberState::Alive {
                 member.set_state(MemberState::Alive);
 
                 return Some(member.clone())
@@ -106,13 +106,13 @@ impl MemberList {
         let mut changed_nodes = Vec::new();
         let mut new_nodes = Vec::new();
 
-        let my_host_key = self.mut_myself().host_key.clone();
+        let my_host_key = self.mut_myself().host_key();
 
         for state_change in state_changes {
             let new_member_data = state_change.member();
-            let old_member_data = current_members.entry(new_member_data.host_key.clone());
+            let old_member_data = current_members.entry(new_member_data.host_key());
 
-            if new_member_data.host_key == my_host_key {
+            if new_member_data.host_key() == my_host_key {
                 if new_member_data.state() != MemberState::Alive {
                     let myself = self.reincarnate_self();
                     changed_nodes.push(myself.clone());
@@ -122,7 +122,7 @@ impl MemberList {
                 match old_member_data {
                     Entry::Occupied(mut entry) => {
                         let new_member = member::most_recent_member_data(&new_member_data, entry.get()).clone();
-                        let new_host = new_member.remote_host.or(entry.get().remote_host).unwrap();
+                        let new_host = new_member.remote_host().or(entry.get().remote_host()).unwrap();
                         let new_member = new_member.member_by_changing_host(new_host);
 
                         if new_member.state() != entry.get().state() {
@@ -131,7 +131,7 @@ impl MemberList {
                         }
                     },
                     Entry::Vacant(entry) => {
-                        let new_host = new_member_data.remote_host.unwrap_or(*from);
+                        let new_host = new_member_data.remote_host().unwrap_or(*from);
                         let new_member = new_member_data.member_by_changing_host(new_host);
 
                         entry.insert(new_member.clone());
@@ -152,8 +152,8 @@ impl MemberList {
             .filter(|m|
                 m.state() == MemberState::Alive
                 && m.is_remote()
-                && m.remote_host != Some(*target))
-            .map(|m| m.remote_host.unwrap())
+                && m.remote_host() != Some(*target))
+            .map(|m| m.remote_host().unwrap())
             .collect();
 
         rand::thread_rng().shuffle(&mut possible_members);
@@ -162,7 +162,7 @@ impl MemberList {
     }
 
     pub fn has_member(&self, remote_host: &SocketAddr) -> bool {
-        self.members.iter().any(|ref m| m.remote_host == Some(*remote_host))
+        self.members.iter().any(|ref m| m.remote_host() == Some(*remote_host))
     }
 
     pub fn add_member(&mut self, member: Member) {

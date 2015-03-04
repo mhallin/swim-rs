@@ -206,7 +206,7 @@ fn enqueue_seed_nodes(seed_nodes: &[SocketAddr], tx: &Sender<TargetedRequest>) {
 
 fn enqueue_random_ping(state: &mut State, tx: &Sender<TargetedRequest>) {
     if let Some(member) = state.members.next_random_member() {
-        tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host.unwrap().clone() }).unwrap();
+        tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host().unwrap() }).unwrap();
     }
 }
 
@@ -241,7 +241,7 @@ fn prune_timed_out_responses(state: &mut State, event_tx: &Sender<(Vec<Member>, 
 }
 
 fn send_ping_requests(state: &State, target: &Member, request_tx: &Sender<TargetedRequest>) {
-    if let Some(target_host) = target.remote_host {
+    if let Some(target_host) = target.remote_host() {
         for relay in state.members.hosts_for_indirect_ping(&target_host) {
             request_tx.send(TargetedRequest {
                 request: Request::PingRequest(EncSocketAddr::from_addr(&target_host)),
@@ -294,8 +294,8 @@ fn process_internal_request(state: &mut State, message: InternalRequest, event_t
                         Some(TargetedRequest { request: Ping, target: dest_addr.addr })
                     },
                     AckHost(member) => {
-                        ack_response(state, member.remote_host.unwrap());
-                        mark_node_alive(state, member.remote_host.unwrap(), event_tx, request_tx);
+                        ack_response(state, member.remote_host().unwrap());
+                        mark_node_alive(state, member.remote_host().unwrap(), event_tx, request_tx);
                         None
                     }
                 };
@@ -331,7 +331,7 @@ fn ack_response(state: &mut State, src_addr: SocketAddr) {
         to_remove.push((t.clone(), addr.clone(), state_changes.clone()));
 
         state.state_changes
-            .retain(|os| !state_changes.iter().any(| is | is.member().host_key == os.member().host_key))
+            .retain(|os| !state_changes.iter().any(| is | is.member().host_key() == os.member().host_key()))
     }
 
     state.pending_responses.retain(|op| !to_remove.iter().any(|ip| ip == op));
@@ -395,7 +395,7 @@ fn determine_cluster_event(member: Member) -> ClusterEvent {
 fn enqueue_state_change(state: &mut State, members: &[Member]) {
     for member in members {
         for state_change in &mut state.state_changes {
-            if state_change.member().host_key == member.host_key {
+            if state_change.member().host_key() == member.host_key() {
                 state_change.update(member.clone());
                 return;
             }
@@ -426,31 +426,5 @@ impl Encodable for EncSocketAddr {
 impl EncSocketAddr {
     fn from_addr(addr: &SocketAddr) -> Self {
         EncSocketAddr { addr: addr.clone() }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::str::FromStr;
-
-    use rustc_serialize::json;
-    use uuid;
-    use time;
-    use super::{Member, MemberState};
-
-    #[test]
-    fn test_member_encode_decode() {
-        let member = Member {
-            host_key: uuid::Uuid::new_v4(),
-            remote_host: Some(FromStr::from_str("127.0.0.1:2552").unwrap()),
-            incarnation: 123,
-            member_state: MemberState::Alive,
-            last_state_change: time::at_utc(time::Timespec::new(123, 456)),
-        };
-
-        let encoded = json::encode(&member).unwrap();
-        let decoded = json::decode(&encoded).unwrap();
-
-        assert_eq!(decoded, member);
     }
 }

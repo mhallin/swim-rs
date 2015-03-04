@@ -19,10 +19,9 @@ pub enum MemberState {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Member {
-    pub host_key: Uuid,
-    pub remote_host: Option<SocketAddr>,
-    pub incarnation: u64,
-
+    host_key: Uuid,
+    remote_host: Option<SocketAddr>,
+    incarnation: u64,
     member_state: MemberState,
     last_state_change: time::Tm,
 }
@@ -45,6 +44,14 @@ impl Member {
             host_key: host_key, remote_host: None, incarnation: 0,
             member_state: MemberState::Alive, last_state_change: time::now_utc(),
         }
+    }
+
+    pub fn host_key(&self) -> Uuid {
+        self.host_key.clone()
+    }
+
+    pub fn remote_host(&self) -> Option<SocketAddr> {
+        self.remote_host
     }
 
     pub fn is_remote(&self) -> bool {
@@ -75,6 +82,10 @@ impl Member {
             remote_host: Some(remote_host),
             .. self.clone()
         }
+    }
+
+    pub fn reincarnate(&mut self) {
+        self.incarnation += 1
     }
 }
 
@@ -203,3 +214,28 @@ pub fn most_recent_member_data<'a>(lhs: &'a Member, rhs: &'a Member) -> &'a Memb
     return if lhs_overrides { lhs } else { rhs };
 }
 
+#[cfg(test)]
+mod test {
+    use std::str::FromStr;
+
+    use rustc_serialize::json;
+    use uuid;
+    use time;
+    use super::{Member, MemberState};
+
+    #[test]
+    fn test_member_encode_decode() {
+        let member = Member {
+            host_key: uuid::Uuid::new_v4(),
+            remote_host: Some(FromStr::from_str("127.0.0.1:2552").unwrap()),
+            incarnation: 123,
+            member_state: MemberState::Alive,
+            last_state_change: time::at_utc(time::Timespec::new(123, 456)),
+        };
+
+        let encoded = json::encode(&member).unwrap();
+        let decoded = json::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, member);
+    }
+}
