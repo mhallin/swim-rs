@@ -29,6 +29,7 @@ use member::{Member, MemberState, StateChange};
 use memberlist::MemberList;
 
 pub type ClusterEvent = (Vec<Member>, MemberEvent);
+type WaitList = HashMap<SocketAddr, Vec<SocketAddr>>;
 
 #[derive(Debug)]
 pub enum MemberEvent {
@@ -73,7 +74,7 @@ struct State {
     seed_queue: Vec<SocketAddr>,
     pending_responses: Vec<(time::Tm, SocketAddr, Vec<StateChange>)>,
     state_changes: Vec<StateChange>,
-    wait_list: HashMap<SocketAddr, Vec<SocketAddr>>,
+    wait_list: WaitList,
     socket: UdpSocket,
     request_tx: Sender<TargetedRequest>,
     event_tx: Sender<ClusterEvent>,
@@ -118,15 +119,15 @@ pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_
         loop {
             select!(
                 _ = periodic.recv() => {
-                    enqueue_seed_nodes(&state.seed_queue, &state.request_tx);
-                    enqueue_random_ping(&mut state);
+                    state.enqueue_seed_nodes();
+                    state.enqueue_random_ping();
                 },
                 request = request_rx.recv() => {
-                    prune_timed_out_responses(&mut state);
-                    process_request(&mut state, request.unwrap());
+                    state.prune_timed_out_responses();
+                    state.process_request(request.unwrap());
                 },
                 internal_message = internal_rx.recv() => {
-                    process_internal_request(&mut state, internal_message.unwrap());
+                    state.process_internal_request(internal_message.unwrap());
                 }
             );
         }
@@ -159,22 +160,198 @@ impl Cluster {
     }
 }
 
-fn process_request(state: &mut State, request: TargetedRequest) {
-    use Request::*;
+impl State {
+    fn process_request(&mut self, request: TargetedRequest) {
+        use Request::*;
 
-    let timeout = time::now_utc() + Duration::seconds(3);
-    let should_add_pending = match request.request { Ping => true, _ => false };
-    let message = build_message(&state.host_key, &state.cluster_key, request.request, state.state_changes.clone());
+        let timeout = time::now_utc() + Duration::seconds(3);
+        let should_add_pending = match request.request { Ping => true, _ => false };
+        let message = build_message(&self.host_key, &self.cluster_key, request.request, self.state_changes.clone());
 
-    if should_add_pending {
-        state.pending_responses.push((timeout, request.target.clone(), message.state_changes.clone()));
+        if should_add_pending {
+            self.pending_responses.push((timeout, request.target.clone(), message.state_changes.clone()));
+        }
+
+        let encoded = json::encode(&message).unwrap();
+
+        assert!(encoded.len() < 512);
+
+        self.socket.send_to(encoded.as_bytes(), request.target).unwrap();
     }
 
-    let encoded = json::encode(&message).unwrap();
+    fn enqueue_seed_nodes(&self) {
+        for seed_node in &self.seed_queue {
+            self.request_tx.send(TargetedRequest { request: Request::Ping, target: seed_node.clone() }).unwrap();
+        }
+    }
 
-    assert!(encoded.len() < 512);
+    fn enqueue_random_ping(&mut self) {
+        if let Some(member) = self.members.next_random_member() {
+            self.request_tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host().unwrap() }).unwrap();
+        }
+    }
 
-    state.socket.send_to(encoded.as_bytes(), request.target).unwrap();
+    fn prune_timed_out_responses(&mut self) {
+        let now = time::now_utc();
+
+        let (remaining, expired): (Vec<_>, Vec<_>) = self.pending_responses
+            .iter()
+            .cloned()
+            .partition(| &(t, _, _) | t < now);
+
+        let expired_hosts: HashSet<SocketAddr> = expired
+            .iter()
+            .map(| &(_, a, _) | a)
+            .collect();
+
+        self.pending_responses = remaining;
+
+        let (suspect, down) = self.members.time_out_nodes(expired_hosts);
+
+        enqueue_state_change(&mut self.state_changes, down.as_slice());
+        enqueue_state_change(&mut self.state_changes, suspect.as_slice());
+
+        for member in suspect {
+            self.send_ping_requests(&member);
+            self.send_member_event(MemberEvent::MemberSuspectedDown(member.clone()));
+        }
+
+        for member in down {
+            self.send_member_event(MemberEvent::MemberWentDown(member.clone()));
+        }
+    }
+
+    fn send_ping_requests(&self, target: &Member) {
+        if let Some(target_host) = target.remote_host() {
+            for relay in self.members.hosts_for_indirect_ping(&target_host) {
+                self.request_tx.send(TargetedRequest {
+                    request: Request::PingRequest(EncSocketAddr::from_addr(&target_host)),
+                    target: relay,
+                }).unwrap();
+            }
+        }
+    }
+
+    fn process_internal_request(&mut self, message: InternalRequest) {
+        use InternalRequest::*;
+
+        match message {
+            AddSeed(addr) => self.seed_queue.push(addr),
+            Respond(src_addr, message) => self.respond_to_message(src_addr, message),
+        };
+    }
+
+    fn respond_to_message(&mut self, src_addr: SocketAddr, message: Message) {
+        use Request::*;
+
+        if message.cluster_key != self.cluster_key {
+            println!("ERROR: Mismatching cluster keys, ignoring message");
+        }
+        else {
+            self.apply_state_changes(message.state_changes, src_addr);
+            remove_potential_seed(&mut self.seed_queue, src_addr);
+
+            self.ensure_node_is_member(src_addr, message.sender);
+
+            let response = match message.request {
+                Ping => Some(TargetedRequest { request: Ack, target: src_addr }),
+                Ack => {
+                    self.ack_response(src_addr);
+                    self.mark_node_alive(src_addr);
+                    None
+                },
+                PingRequest(dest_addr) => {
+                    let EncSocketAddr(dest_addr) = dest_addr;
+                    add_to_wait_list(&mut self.wait_list, &dest_addr, &src_addr);
+                    Some(TargetedRequest { request: Ping, target: dest_addr })
+                },
+                AckHost(member) => {
+                    self.ack_response(member.remote_host().unwrap());
+                    self.mark_node_alive(member.remote_host().unwrap());
+                    None
+                }
+            };
+
+            match response {
+                Some(response) => self.request_tx.send(response).unwrap(),
+                None => (),
+            };
+        }
+    }
+
+    fn ack_response(&mut self, src_addr: SocketAddr) {
+        let mut to_remove = Vec::new();
+
+        for &(ref t, ref addr, ref state_changes) in self.pending_responses.iter() {
+            if src_addr != *addr {
+                continue;
+            }
+
+            to_remove.push((t.clone(), addr.clone(), state_changes.clone()));
+
+            self.state_changes
+                .retain(|os| !state_changes.iter().any(| is | is.member().host_key() == os.member().host_key()))
+        }
+
+        self.pending_responses.retain(|op| !to_remove.iter().any(|ip| ip == op));
+    }
+
+    fn ensure_node_is_member(&mut self, src_addr: SocketAddr, sender: Uuid) {
+        if self.members.has_member(&src_addr) {
+            return;
+        }
+
+        let new_member = Member::new(sender, src_addr, 0, MemberState::Alive);
+
+        self.members.add_member(new_member.clone());
+        enqueue_state_change(&mut self.state_changes, &[new_member.clone()]);
+        self.send_member_event(MemberEvent::MemberJoined(new_member));
+    }
+
+    fn send_member_event(&self, event: MemberEvent) {
+        use MemberEvent::*;
+
+        match event {
+            MemberJoined(_) => {},
+            MemberWentUp(ref m) => assert_eq!(m.state(), MemberState::Alive),
+            MemberWentDown(ref m) => assert_eq!(m.state(), MemberState::Down),
+            MemberSuspectedDown(ref m) => assert_eq!(m.state(), MemberState::Suspect),
+        };
+
+        self.event_tx.send((self.members.to_vec(), event)).unwrap();
+    }
+
+    fn apply_state_changes(&mut self, state_changes: Vec<StateChange>, from: SocketAddr) {
+        let (new, changed) = self.members.apply_state_changes(state_changes, &from);
+
+        enqueue_state_change(&mut self.state_changes, new.as_slice());
+        enqueue_state_change(&mut self.state_changes, changed.as_slice());
+
+        for member in new {
+            self.send_member_event(MemberEvent::MemberJoined(member));
+        }
+
+        for member in changed {
+            self.send_member_event(determine_member_event(member));
+        }
+    }
+
+    fn mark_node_alive(&mut self, src_addr: SocketAddr) {
+        if let Some(member) = self.members.mark_node_alive(&src_addr) {
+            match self.wait_list.get_mut(&src_addr) {
+                Some(mut wait_list) => {
+                    for remote in wait_list.drain() {
+                        self.request_tx.send(TargetedRequest { request: Request::AckHost(member.clone()), target: remote }).unwrap();
+                    }
+                },
+                None => ()
+            };
+
+            enqueue_state_change(&mut self.state_changes, &[member.clone()]);
+            self.send_member_event(MemberEvent::MemberWentUp(member.clone()));
+        }
+    }
+
 }
 
 fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_changes: Vec<StateChange>) -> Message {
@@ -202,187 +379,15 @@ fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_c
     return message;
 }
 
-fn enqueue_seed_nodes(seed_nodes: &[SocketAddr], tx: &Sender<TargetedRequest>) {
-    for seed_node in seed_nodes {
-        tx.send(TargetedRequest { request: Request::Ping, target: seed_node.clone() }).unwrap();
-    }
-}
-
-fn enqueue_random_ping(state: &mut State) {
-    if let Some(member) = state.members.next_random_member() {
-        state.request_tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host().unwrap() }).unwrap();
-    }
-}
-
-fn prune_timed_out_responses(state: &mut State) {
-    let now = time::now_utc();
-
-    let (remaining, expired): (Vec<_>, Vec<_>) = state.pending_responses
-        .iter()
-        .cloned()
-        .partition(| &(t, _, _) | t < now);
-
-    let expired_hosts: HashSet<SocketAddr> = expired
-        .iter()
-        .map(| &(_, a, _) | a)
-        .collect();
-
-    state.pending_responses = remaining;
-
-    let (suspect, down) = state.members.time_out_nodes(expired_hosts);
-
-    enqueue_state_change(state, down.as_slice());
-    enqueue_state_change(state, suspect.as_slice());
-
-    for member in suspect {
-        send_ping_requests(state, &member);
-        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberSuspectedDown(member.clone()));
-    }
-
-    for member in down {
-        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberWentDown(member.clone()));
-    }
-}
-
-fn send_ping_requests(state: &State, target: &Member) {
-    if let Some(target_host) = target.remote_host() {
-        for relay in state.members.hosts_for_indirect_ping(&target_host) {
-            state.request_tx.send(TargetedRequest {
-                request: Request::PingRequest(EncSocketAddr::from_addr(&target_host)),
-                target: relay,
-            }).unwrap();
-        }
-    }
-}
-
-fn send_member_event(members: &MemberList, event_tx: &Sender<ClusterEvent>, event: MemberEvent) {
-    use MemberEvent::*;
-
-    match event {
-        MemberJoined(_) => {},
-        MemberWentUp(ref m) => assert_eq!(m.state(), MemberState::Alive),
-        MemberWentDown(ref m) => assert_eq!(m.state(), MemberState::Down),
-        MemberSuspectedDown(ref m) => assert_eq!(m.state(), MemberState::Suspect),
-    };
-
-    event_tx.send((members.to_vec(), event)).unwrap();
-}
-
-fn process_internal_request(state: &mut State, message: InternalRequest) {
-    use InternalRequest::*;
-    use Request::*;
-
-    match message {
-        AddSeed(addr) => {
-            state.seed_queue.push(addr);
-        },
-        Respond(src_addr, message) => {
-            if message.cluster_key != state.cluster_key {
-                println!("ERROR: Mismatching cluster keys, ignoring message");
-            }
-            else {
-                apply_state_changes(state, message.state_changes, src_addr);
-                remove_potential_seed(state, src_addr);
-
-                ensure_node_is_member(state, src_addr, message.sender);
-
-                let response = match message.request {
-                    Ping => Some(TargetedRequest { request: Ack, target: src_addr }),
-                    Ack => {
-                        ack_response(state, src_addr);
-                        mark_node_alive(state, src_addr);
-                        None
-                    },
-                    PingRequest(dest_addr) => {
-                        let EncSocketAddr(dest_addr) = dest_addr;
-                        add_to_wait_list(state, &dest_addr, &src_addr);
-                        Some(TargetedRequest { request: Ping, target: dest_addr })
-                    },
-                    AckHost(member) => {
-                        ack_response(state, member.remote_host().unwrap());
-                        mark_node_alive(state, member.remote_host().unwrap());
-                        None
-                    }
-                };
-
-                match response {
-                    Some(response) => state.request_tx.send(response).unwrap(),
-                    None => (),
-                };
-            }
-        },
-    };
-}
-
-fn add_to_wait_list(state: &mut State, wait_addr: &SocketAddr, notify_addr: &SocketAddr) {
-    match state.wait_list.entry(*wait_addr) {
+fn add_to_wait_list(wait_list: &mut WaitList, wait_addr: &SocketAddr, notify_addr: &SocketAddr) {
+    match wait_list.entry(*wait_addr) {
         Entry::Occupied(mut entry) => { entry.get_mut().push(notify_addr.clone()); },
         Entry::Vacant(entry) => { entry.insert(vec![notify_addr.clone()]); }
     };
 }
 
-fn remove_potential_seed(state: &mut State, src_addr: SocketAddr) {
-    state.seed_queue.retain(|&addr| addr != src_addr)
-}
-
-fn ack_response(state: &mut State, src_addr: SocketAddr) {
-    let mut to_remove = Vec::new();
-
-    for &(ref t, ref addr, ref state_changes) in state.pending_responses.iter() {
-        if src_addr != *addr {
-            continue;
-        }
-
-        to_remove.push((t.clone(), addr.clone(), state_changes.clone()));
-
-        state.state_changes
-            .retain(|os| !state_changes.iter().any(| is | is.member().host_key() == os.member().host_key()))
-    }
-
-    state.pending_responses.retain(|op| !to_remove.iter().any(|ip| ip == op));
-}
-
-fn ensure_node_is_member(state: &mut State, src_addr: SocketAddr, sender: Uuid) {
-    if state.members.has_member(&src_addr) {
-        return;
-    }
-
-    let new_member = Member::new(sender, src_addr, 0, MemberState::Alive);
-
-    state.members.add_member(new_member.clone());
-    enqueue_state_change(state, &[new_member.clone()]);
-    send_member_event(&state.members, &state.event_tx, MemberEvent::MemberJoined(new_member));
-}
-
-fn mark_node_alive(state: &mut State, src_addr: SocketAddr) {
-    if let Some(member) = state.members.mark_node_alive(&src_addr) {
-        match state.wait_list.get_mut(&src_addr) {
-            Some(mut wait_list) => {
-                for remote in wait_list.drain() {
-                    state.request_tx.send(TargetedRequest { request: Request::AckHost(member.clone()), target: remote }).unwrap();
-                }
-            },
-            None => ()
-        };
-
-        enqueue_state_change(state, &[member.clone()]);
-        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberWentUp(member.clone()));
-    }
-}
-
-fn apply_state_changes(state: &mut State, state_changes: Vec<StateChange>, from: SocketAddr) {
-    let (new, changed) = state.members.apply_state_changes(state_changes, &from);
-
-    enqueue_state_change(state, new.as_slice());
-    enqueue_state_change(state, changed.as_slice());
-
-    for member in new {
-        send_member_event(&state.members, &state.event_tx, MemberEvent::MemberJoined(member));
-    }
-
-    for member in changed {
-        send_member_event(&state.members, &state.event_tx, determine_member_event(member));
-    }
+fn remove_potential_seed(seed_queue: &mut Vec<SocketAddr>, src_addr: SocketAddr) {
+    seed_queue.retain(|&addr| addr != src_addr)
 }
 
 fn determine_member_event(member: Member) -> MemberEvent {
@@ -396,16 +401,16 @@ fn determine_member_event(member: Member) -> MemberEvent {
     };
 }
 
-fn enqueue_state_change(state: &mut State, members: &[Member]) {
+fn enqueue_state_change(state_changes: &mut Vec<StateChange>, members: &[Member]) {
     for member in members {
-        for state_change in &mut state.state_changes {
+        for state_change in state_changes.iter_mut() {
             if state_change.member().host_key() == member.host_key() {
                 state_change.update(member.clone());
                 return;
             }
         }
 
-        state.state_changes.push(StateChange::new(member.clone()));
+        state_changes.push(StateChange::new(member.clone()));
     }
 }
 
