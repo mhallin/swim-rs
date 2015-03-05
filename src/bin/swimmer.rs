@@ -10,6 +10,7 @@ extern crate uuid;
 
 extern crate swim;
 
+use std::default::Default;
 use std::old_io::File;
 use std::old_io::fs::PathExtensions;
 use std::old_path::Path;
@@ -30,8 +31,13 @@ fn main() {
     println!("Swimmer main: {:?}", args);
     println!("Host key: {}", host_key.to_hyphenated_string());
 
+    let config = swim::ClusterConfig {
+        cluster_key: args.arg_cluster_key.as_bytes().to_vec(),
+        .. Default::default()
+    };
+
     let cluster = swim::start_cluster(
-        host_key, args.arg_cluster_key.as_slice(), args.arg_listen_addr.as_slice());
+        host_key, config, args.arg_listen_addr.as_slice());
 
     if args.arg_seed_node.len() > 0 {
         cluster.add_seed_node(args.arg_seed_node.as_slice());

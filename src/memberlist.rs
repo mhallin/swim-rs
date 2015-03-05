@@ -146,7 +146,7 @@ impl MemberList {
         (new_nodes, changed_nodes)
     }
 
-    pub fn hosts_for_indirect_ping(&self, target: &SocketAddr) -> Vec<SocketAddr> {
+    pub fn hosts_for_indirect_ping(&self, host_count: usize, target: &SocketAddr) -> Vec<SocketAddr> {
         let mut possible_members: Vec<_> = self.members
             .iter()
             .filter(|m|
@@ -158,7 +158,7 @@ impl MemberList {
 
         rand::thread_rng().shuffle(&mut possible_members);
 
-        possible_members.iter().take(3).cloned().collect()
+        possible_members.iter().take(host_count).cloned().collect()
     }
 
     pub fn has_member(&self, remote_host: &SocketAddr) -> bool {

@@ -13,6 +13,7 @@ use std::collections::hash_map::Entry;
 use std::old_io::net::ip::{SocketAddr, ToSocketAddr};
 use std::old_io::net::udp::UdpSocket;
 use std::old_io::timer::Timer;
+use std::default::Default;
 use std::str::FromStr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
@@ -44,10 +45,18 @@ pub struct Cluster {
     comm: Sender<InternalRequest>,
 }
 
-#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    pub cluster_key: Vec<u8>,
+    pub ping_interval: Duration,
+    pub network_mtu: usize,
+    pub ping_request_host_count: usize,
+    pub ping_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EncSocketAddr(SocketAddr);
 
-#[derive(RustcEncodable, RustcDecodable, Debug, Clone)]
+#[derive(RustcEncodable, RustcDecodable, Debug, Clone, PartialEq, Eq)]
 enum Request {
     Ping,
     Ack,
@@ -69,7 +78,7 @@ enum InternalRequest {
 
 struct State {
     host_key: Uuid,
-    cluster_key: Vec<u8>,
+    config: ClusterConfig,
     members: MemberList,
     seed_queue: Vec<SocketAddr>,
     pending_responses: Vec<(time::Tm, SocketAddr, Vec<StateChange>)>,
@@ -88,12 +97,12 @@ struct Message {
     state_changes: Vec<StateChange>,
 }
 
-pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_addr: A) -> Cluster {
+pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, config: ClusterConfig, listen_addr: A) -> Cluster {
     let (event_tx, event_rx) = channel();
     let (request_tx, request_rx) = channel();
     let (internal_tx, internal_rx) = channel();
     let socket = UdpSocket::bind(listen_addr).unwrap();
-    let cluster_key = cluster_key.as_bytes().to_vec();
+    let network_mtu = config.network_mtu;
 
     let timeout_tx = request_tx.clone();
     let worker_socket = socket.clone();
@@ -102,7 +111,7 @@ pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_
 
         let mut state = State {
             host_key: host_key,
-            cluster_key: cluster_key,
+            config: config,
             members: MemberList::new(me.clone()),
             seed_queue: Vec::new(),
             pending_responses: Vec::new(),
@@ -114,7 +123,7 @@ pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_
         };
 
         let mut timer = Timer::new().unwrap();
-        let periodic = timer.periodic(Duration::seconds(1));
+        let periodic = timer.periodic(state.config.ping_interval);
 
         loop {
             select!(
@@ -137,7 +146,7 @@ pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, cluster_key: &str, listen_
     let mut listener_socket = socket.clone();
     thread::spawn(move || {
         loop {
-            let mut buf = [0; 512];
+            let mut buf = vec![0; network_mtu];
 
             match listener_socket.recv_from(&mut buf) {
                 Ok((size, src_addr)) => {
@@ -164,9 +173,9 @@ impl State {
     fn process_request(&mut self, request: TargetedRequest) {
         use Request::*;
 
-        let timeout = time::now_utc() + Duration::seconds(3);
-        let should_add_pending = match request.request { Ping => true, _ => false };
-        let message = build_message(&self.host_key, &self.cluster_key, request.request, self.state_changes.clone());
+        let timeout = time::now_utc() + self.config.ping_timeout;
+        let should_add_pending = request.request == Ping;
+        let message = build_message(&self.host_key, &self.config.cluster_key, request.request, self.state_changes.clone(), self.config.network_mtu);
 
         if should_add_pending {
             self.pending_responses.push((timeout, request.target.clone(), message.state_changes.clone()));
@@ -174,7 +183,7 @@ impl State {
 
         let encoded = json::encode(&message).unwrap();
 
-        assert!(encoded.len() < 512);
+        assert!(encoded.len() < self.config.network_mtu);
 
         self.socket.send_to(encoded.as_bytes(), request.target).unwrap();
     }
@@ -223,7 +232,7 @@ impl State {
 
     fn send_ping_requests(&self, target: &Member) {
         if let Some(target_host) = target.remote_host() {
-            for relay in self.members.hosts_for_indirect_ping(&target_host) {
+            for relay in self.members.hosts_for_indirect_ping(self.config.ping_request_host_count, &target_host) {
                 self.request_tx.send(TargetedRequest {
                     request: Request::PingRequest(EncSocketAddr::from_addr(&target_host)),
                     target: relay,
@@ -244,7 +253,7 @@ impl State {
     fn respond_to_message(&mut self, src_addr: SocketAddr, message: Message) {
         use Request::*;
 
-        if message.cluster_key != self.cluster_key {
+        if message.cluster_key != self.config.cluster_key {
             println!("ERROR: Mismatching cluster keys, ignoring message");
         }
         else {
@@ -351,10 +360,9 @@ impl State {
             self.send_member_event(MemberEvent::MemberWentUp(member.clone()));
         }
     }
-
 }
 
-fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_changes: Vec<StateChange>) -> Message {
+fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_changes: Vec<StateChange>, network_mtu: usize) -> Message {
     let mut message = Message {
         sender: sender.clone(),
         cluster_key: cluster_key.clone(),
@@ -371,7 +379,7 @@ fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_c
         };
 
         let encoded = json::encode(&message).unwrap();
-        if encoded.len() >= 512 {
+        if encoded.len() >= network_mtu {
             return message;
         }
     }
@@ -436,5 +444,17 @@ impl Encodable for EncSocketAddr {
 impl EncSocketAddr {
     fn from_addr(addr: &SocketAddr) -> Self {
         EncSocketAddr(addr.clone())
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        ClusterConfig {
+            cluster_key: "default".as_bytes().to_vec(),
+            ping_interval: Duration::seconds(1),
+            network_mtu: 512,
+            ping_request_host_count: 3,
+            ping_timeout: Duration::seconds(3),
+        }
     }
 }
