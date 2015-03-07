@@ -1,6 +1,7 @@
 #![feature(core)]
-#![feature(old_io)]
-#![feature(old_path)]
+#![feature(io)]
+#![feature(path)]
+#![feature(path_ext)]
 #![feature(plugin)]
 #![plugin(docopt_macros)]
 
@@ -10,10 +11,11 @@ extern crate uuid;
 
 extern crate swim;
 
+use std::io::{Read, Write};
 use std::default::Default;
-use std::old_io::File;
-use std::old_io::fs::PathExtensions;
-use std::old_path::Path;
+use std::fs::File;
+use std::fs::PathExt;
+use std::path::Path;
 
 use uuid::Uuid;
 
@@ -62,7 +64,8 @@ fn read_host_key(root_folder: &Path) -> Uuid {
     let host_key_path = root_folder.join("host_key");
 
     if host_key_path.exists() {
-        let host_key_contents = File::open(&host_key_path).unwrap().read_to_end().unwrap();
+        let mut host_key_contents = Vec::new();
+        File::open(&host_key_path).unwrap().read_to_end(&mut host_key_contents).unwrap();
 
         return Uuid::from_bytes(host_key_contents.as_slice()).unwrap();
     }
