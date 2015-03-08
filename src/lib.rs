@@ -38,6 +38,7 @@ pub enum MemberEvent {
     MemberWentUp(Member),
     MemberSuspectedDown(Member),
     MemberWentDown(Member),
+    MemberLeft(Member),
 }
 
 pub struct Cluster {
@@ -74,6 +75,7 @@ struct TargetedRequest {
 enum InternalRequest {
     AddSeed(SocketAddr),
     Respond(SocketAddr, Message),
+    LeaveCluster,
 }
 
 struct State {
@@ -167,6 +169,10 @@ impl Cluster {
     pub fn add_seed_node<A: ToSocketAddr>(&self, addr: A) {
         self.comm.send(InternalRequest::AddSeed(addr.to_socket_addr().unwrap())).unwrap();
     }
+
+    pub fn leave_cluster(&self) {
+        self.comm.send(InternalRequest::LeaveCluster).unwrap();
+    }
 }
 
 impl State {
@@ -247,6 +253,10 @@ impl State {
         match message {
             AddSeed(addr) => self.seed_queue.push(addr),
             Respond(src_addr, message) => self.respond_to_message(src_addr, message),
+            LeaveCluster => {
+                let myself = self.members.leave();
+                enqueue_state_change(&mut self.state_changes, &[myself]);
+            }
         };
     }
 
@@ -325,9 +335,10 @@ impl State {
             MemberWentUp(ref m) => assert_eq!(m.state(), MemberState::Alive),
             MemberWentDown(ref m) => assert_eq!(m.state(), MemberState::Down),
             MemberSuspectedDown(ref m) => assert_eq!(m.state(), MemberState::Suspect),
+            MemberLeft(ref m) => assert_eq!(m.state(), MemberState::Left),
         };
 
-        self.event_tx.send((self.members.to_vec(), event)).unwrap();
+        self.event_tx.send((self.members.available_nodes(), event)).unwrap();
     }
 
     fn apply_state_changes(&mut self, state_changes: Vec<StateChange>, from: SocketAddr) {
@@ -406,6 +417,7 @@ fn determine_member_event(member: Member) -> MemberEvent {
         Alive => MemberWentUp(member),
         Suspect => MemberSuspectedDown(member),
         Down => MemberWentDown(member),
+        Left => MemberLeft(member),
     };
 }
 

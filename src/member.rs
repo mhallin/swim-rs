@@ -15,6 +15,7 @@ pub enum MemberState {
     Alive,
     Suspect,
     Down,
+    Left,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -208,6 +209,7 @@ pub fn most_recent_member_data<'a>(lhs: &'a Member, rhs: &'a Member) -> &'a Memb
         (Suspect, i, Alive, j) => i >= j,
         (Down, _, Alive, _) => true,
         (Down, _, Suspect, _) => true,
+        (Left, _, _, _) => true,
         _ => false,
     };
 

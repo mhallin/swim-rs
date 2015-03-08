@@ -23,8 +23,8 @@ impl MemberList {
         }
     }
 
-    pub fn to_vec(&self) -> Vec<Member> {
-        self.members.clone()
+    pub fn available_nodes(&self) -> Vec<Member> {
+        self.members.iter().filter(|ref m| m.state() != MemberState::Left).cloned().collect()
     }
 
     pub fn to_map(&self) -> HashMap<Uuid, Member> {
@@ -43,6 +43,14 @@ impl MemberList {
 
     pub fn reincarnate_self(&mut self) -> Member {
         let myself = self.mut_myself();
+        myself.reincarnate();
+
+        myself.clone()
+    }
+
+    pub fn leave(&mut self) -> Member {
+        let myself = self.mut_myself();
+        myself.set_state(MemberState::Left);
         myself.reincarnate();
 
         myself.clone()
