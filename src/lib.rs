@@ -26,8 +26,10 @@ use uuid::Uuid;
 mod member;
 mod memberlist;
 
-use member::{Member, MemberState, StateChange};
+use member::StateChange;
 use memberlist::MemberList;
+
+pub use member::{Member, MemberState};
 
 pub type ClusterEvent = (Vec<Member>, MemberEvent);
 type WaitList = HashMap<SocketAddr, Vec<SocketAddr>>;
@@ -52,6 +54,7 @@ pub struct ClusterConfig {
     pub network_mtu: usize,
     pub ping_request_host_count: usize,
     pub ping_timeout: Duration,
+    pub listen_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,70 +102,78 @@ struct Message {
     state_changes: Vec<StateChange>,
 }
 
-pub fn start_cluster<A: ToSocketAddr>(host_key: Uuid, config: ClusterConfig, listen_addr: A) -> Cluster {
+pub fn start_cluster(host_key: Uuid, config: ClusterConfig) -> Cluster {
     let (event_tx, event_rx) = channel();
-    let (request_tx, request_rx) = channel();
     let (internal_tx, internal_rx) = channel();
-    let socket = UdpSocket::bind(listen_addr).unwrap();
-    let network_mtu = config.network_mtu;
 
-    let timeout_tx = request_tx.clone();
-    let worker_socket = socket.clone();
+    let runner_tx = internal_tx.clone();
     thread::spawn(move || {
-        let me = Member::myself(host_key.clone());
-
-        let mut state = State {
-            host_key: host_key,
-            config: config,
-            members: MemberList::new(me.clone()),
-            seed_queue: Vec::new(),
-            pending_responses: Vec::new(),
-            state_changes: vec![StateChange::new(me)],
-            wait_list: HashMap::new(),
-            socket: worker_socket,
-            request_tx: timeout_tx,
-            event_tx: event_tx,
-        };
-
-        let mut timer = Timer::new().unwrap();
-        let periodic = timer.periodic(state.config.ping_interval);
-
-        loop {
-            select!(
-                _ = periodic.recv() => {
-                    state.enqueue_seed_nodes();
-                    state.enqueue_random_ping();
-                },
-                request = request_rx.recv() => {
-                    state.prune_timed_out_responses();
-                    state.process_request(request.unwrap());
-                },
-                internal_message = internal_rx.recv() => {
-                    state.process_internal_request(internal_message.unwrap());
-                }
-            );
-        }
-    });
-
-    let listener_tx = internal_tx.clone();
-    let mut listener_socket = socket.clone();
-    thread::spawn(move || {
-        loop {
-            let mut buf = vec![0; network_mtu];
-
-            match listener_socket.recv_from(&mut buf) {
-                Ok((size, src_addr)) => {
-                    let message = json::decode(&*String::from_utf8_lossy(&buf[..size]));
-                    listener_tx.send(InternalRequest::Respond(src_addr, message.unwrap())).unwrap();
-                },
-                Err(e) => {
-                    println!("Error while reading: {:?}", e);
-                }
-            };
-        }
+        run_main_loop(host_key, config, event_tx, runner_tx, internal_rx);
     });
 
     return Cluster { events: event_rx, comm: internal_tx };
+}
+
+fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<ClusterEvent>, internal_tx: Sender<InternalRequest>, internal_rx: Receiver<InternalRequest>) {
+    let (request_tx, request_rx) = channel();
+    let socket = UdpSocket::bind(config.listen_addr).unwrap();
+
+    let listener_tx = internal_tx.clone();
+    let listener_socket = socket.clone();
+    let network_mtu = config.network_mtu;
+    let listen_thread = thread::spawn(move || {
+        run_udp_listen_loop(listener_socket, listener_tx, network_mtu);
+    });
+
+    let me = Member::myself(host_key.clone());
+
+    let mut state = State {
+        host_key: host_key,
+        config: config,
+        members: MemberList::new(me.clone()),
+        seed_queue: Vec::new(),
+        pending_responses: Vec::new(),
+        state_changes: vec![StateChange::new(me)],
+        wait_list: HashMap::new(),
+        socket: socket,
+        request_tx: request_tx,
+        event_tx: event_tx,
+    };
+
+    let mut timer = Timer::new().unwrap();
+    let periodic = timer.periodic(state.config.ping_interval);
+
+    loop {
+        select!(
+            _ = periodic.recv() => {
+                state.enqueue_seed_nodes();
+                state.enqueue_random_ping();
+            },
+            request = request_rx.recv() => {
+                state.prune_timed_out_responses();
+                state.process_request(request.unwrap());
+            },
+            internal_message = internal_rx.recv() => {
+                state.process_internal_request(internal_message.unwrap());
+            }
+        );
+    }
+}
+
+fn run_udp_listen_loop(mut listener_socket: UdpSocket, listener_tx: Sender<InternalRequest>, network_mtu: usize) {
+    loop {
+        let mut buf = vec![0; network_mtu];
+
+        match listener_socket.recv_from(&mut buf) {
+            Ok((size, src_addr)) => {
+                let message = json::decode(&*String::from_utf8_lossy(&buf[..size]));
+                listener_tx.send(InternalRequest::Respond(src_addr, message.unwrap())).unwrap();
+            },
+            Err(e) => {
+                println!("Error while reading: {:?}", e);
+            }
+        };
+    }
 }
 
 impl Cluster {
@@ -173,6 +184,7 @@ impl Cluster {
     pub fn leave_cluster(&self) {
         self.comm.send(InternalRequest::LeaveCluster).unwrap();
     }
+
 }
 
 impl State {
@@ -467,6 +479,7 @@ impl Default for ClusterConfig {
             network_mtu: 512,
             ping_request_host_count: 3,
             ping_timeout: Duration::seconds(3),
+            listen_addr: "127.0.0.1:2552".to_socket_addr().unwrap(),
         }
     }
 }

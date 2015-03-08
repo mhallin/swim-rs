@@ -1,4 +1,5 @@
 #![feature(core)]
+#![feature(old_io)]
 #![feature(io)]
 #![feature(path)]
 #![feature(path_ext)]
@@ -16,6 +17,7 @@ use std::default::Default;
 use std::fs::File;
 use std::fs::PathExt;
 use std::path::Path;
+use std::old_io::net::ip::ToSocketAddr;
 
 use uuid::Uuid;
 
@@ -35,11 +37,11 @@ fn main() {
 
     let config = swim::ClusterConfig {
         cluster_key: args.arg_cluster_key.as_bytes().to_vec(),
+        listen_addr: args.arg_listen_addr.as_slice().to_socket_addr().unwrap(),
         .. Default::default()
     };
 
-    let cluster = swim::start_cluster(
-        host_key, config, args.arg_listen_addr.as_slice());
+    let cluster = swim::start_cluster(host_key, config);
 
     if args.arg_seed_node.len() > 0 {
         cluster.add_seed_node(args.arg_seed_node.as_slice());
