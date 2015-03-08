@@ -13,8 +13,10 @@ use std::collections::hash_map::Entry;
 use std::old_io::net::ip::{SocketAddr, ToSocketAddr};
 use std::old_io::net::udp::UdpSocket;
 use std::old_io::timer::Timer;
+use std::old_io::{IoError, IoErrorKind};
 use std::default::Default;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 use std::thread;
@@ -74,11 +76,12 @@ struct TargetedRequest {
     target: SocketAddr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum InternalRequest {
     AddSeed(SocketAddr),
     Respond(SocketAddr, Message),
     LeaveCluster,
+    Exit(Sender<()>),
 }
 
 struct State {
@@ -117,12 +120,14 @@ pub fn start_cluster(host_key: Uuid, config: ClusterConfig) -> Cluster {
 fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<ClusterEvent>, internal_tx: Sender<InternalRequest>, internal_rx: Receiver<InternalRequest>) {
     let (request_tx, request_rx) = channel();
     let socket = UdpSocket::bind(config.listen_addr).unwrap();
+    let stop_listener_cell = Arc::new(Mutex::new(false));
 
     let listener_tx = internal_tx.clone();
     let listener_socket = socket.clone();
     let network_mtu = config.network_mtu;
+    let listener_cell = stop_listener_cell.clone();
     let listen_thread = thread::spawn(move || {
-        run_udp_listen_loop(listener_socket, listener_tx, network_mtu);
+        run_udp_listen_loop(listener_cell, listener_socket, listener_tx, network_mtu);
     });
 
     let me = Member::myself(host_key.clone());
@@ -143,6 +148,8 @@ fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<Cluster
     let mut timer = Timer::new().unwrap();
     let periodic = timer.periodic(state.config.ping_interval);
 
+    let mut exit_tx = None;
+
     loop {
         select!(
             _ = periodic.recv() => {
@@ -154,14 +161,39 @@ fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<Cluster
                 state.process_request(request.unwrap());
             },
             internal_message = internal_rx.recv() => {
-                state.process_internal_request(internal_message.unwrap());
+                exit_tx = state.process_internal_request(internal_message.unwrap());
             }
         );
+
+        if exit_tx.is_some() {
+            break;
+        }
+    }
+
+    {
+        let mut lock = (*stop_listener_cell).lock().unwrap();
+
+        *lock = true;
+    }
+
+    listen_thread.join();
+
+    if let Some(exit_tx) = exit_tx {
+        exit_tx.send(()).unwrap();
     }
 }
 
-fn run_udp_listen_loop(mut listener_socket: UdpSocket, listener_tx: Sender<InternalRequest>, network_mtu: usize) {
+fn run_udp_listen_loop(stop_signal: Arc<Mutex<bool>>, mut listener_socket: UdpSocket, listener_tx: Sender<InternalRequest>, network_mtu: usize) {
+    listener_socket.set_read_timeout(Some(100));
+
     loop {
+        {
+            let lock = (*stop_signal).lock().unwrap();
+            if *lock {
+                return;
+            }
+        }
+
         let mut buf = vec![0; network_mtu];
 
         match listener_socket.recv_from(&mut buf) {
@@ -169,6 +201,7 @@ fn run_udp_listen_loop(mut listener_socket: UdpSocket, listener_tx: Sender<Inter
                 let message = json::decode(&*String::from_utf8_lossy(&buf[..size]));
                 listener_tx.send(InternalRequest::Respond(src_addr, message.unwrap())).unwrap();
             },
+            Err(IoError { kind: IoErrorKind::TimedOut, desc: _, detail: _ }) => (),
             Err(e) => {
                 println!("Error while reading: {:?}", e);
             }
@@ -184,7 +217,16 @@ impl Cluster {
     pub fn leave_cluster(&self) {
         self.comm.send(InternalRequest::LeaveCluster).unwrap();
     }
+}
 
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        let (tx, rx) = channel();
+
+        self.comm.send(InternalRequest::Exit(tx)).unwrap();
+
+        rx.recv().unwrap();
+    }
 }
 
 impl State {
@@ -259,7 +301,7 @@ impl State {
         }
     }
 
-    fn process_internal_request(&mut self, message: InternalRequest) {
+    fn process_internal_request(&mut self, message: InternalRequest) -> Option<Sender<()>> {
         use InternalRequest::*;
 
         match message {
@@ -268,8 +310,11 @@ impl State {
             LeaveCluster => {
                 let myself = self.members.leave();
                 enqueue_state_change(&mut self.state_changes, &[myself]);
-            }
+            },
+            Exit(tx) => return Some(tx),
         };
+
+        None
     }
 
     fn respond_to_message(&mut self, src_addr: SocketAddr, message: Message) {
