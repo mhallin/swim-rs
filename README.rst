@@ -1,6 +1,9 @@
 SWIM.rs
 =======
 
+.. image:: https://travis-ci.org/mhallin/swim-rs.svg?branch=master
+   :target: https://travis-ci.org/mhallin/swim-rs
+
 A rust implementation of the `Scalable Weakly-consistent Infection-style Process Group Membership
 Protocol`_, a building block for distributed systems which require weakly-consistent knowledge about
 members participating in a cluster.
