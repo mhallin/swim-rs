@@ -179,7 +179,7 @@ fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<Cluster
         *lock = true;
     }
 
-    listen_thread.join();
+    listen_thread.join().ok().unwrap();
 
     if let Some(exit_tx) = exit_tx {
         exit_tx.send(()).unwrap();
