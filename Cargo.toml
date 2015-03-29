@@ -3,6 +3,9 @@
 name = "swim"
 version = "0.0.1"
 authors = ["mhallin <mhallin@gmail.com>"]
+license = "MIT"
+readme = "README.rst"
+homepage = "https://github.com/mhallin/swim-rs"
 
 [lib]
 name = "swim"
