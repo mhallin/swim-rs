@@ -1,9 +1,10 @@
 #![feature(core)]
+#![feature(io)]
 #![feature(old_io)]
 #![feature(std_misc)]
 #![feature(collections)]
 
-extern crate "rustc-serialize" as rustc_serialize;
+extern crate rustc_serialize;
 extern crate time;
 extern crate uuid;
 extern crate rand;
@@ -18,11 +19,11 @@ use std::default::Default;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
 use std::thread;
 
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_serialize::json;
+use time::Duration;
 use uuid::Uuid;
 
 mod member;
@@ -146,7 +147,9 @@ fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<Cluster
     };
 
     let mut timer = Timer::new().unwrap();
-    let periodic = timer.periodic(state.config.ping_interval);
+    let ping_interval = std::time::Duration::microseconds(
+        state.config.ping_interval.num_microseconds().unwrap());
+    let periodic = timer.periodic(ping_interval);
 
     let mut exit_tx = None;
 
@@ -277,8 +280,8 @@ impl State {
 
         let (suspect, down) = self.members.time_out_nodes(expired_hosts);
 
-        enqueue_state_change(&mut self.state_changes, down.as_slice());
-        enqueue_state_change(&mut self.state_changes, suspect.as_slice());
+        enqueue_state_change(&mut self.state_changes, &down);
+        enqueue_state_change(&mut self.state_changes, &suspect);
 
         for member in suspect {
             self.send_ping_requests(&member);
@@ -401,8 +404,8 @@ impl State {
     fn apply_state_changes(&mut self, state_changes: Vec<StateChange>, from: SocketAddr) {
         let (new, changed) = self.members.apply_state_changes(state_changes, &from);
 
-        enqueue_state_change(&mut self.state_changes, new.as_slice());
-        enqueue_state_change(&mut self.state_changes, changed.as_slice());
+        enqueue_state_change(&mut self.state_changes, &new);
+        enqueue_state_change(&mut self.state_changes, &changed);
 
         for member in new {
             self.send_member_event(MemberEvent::MemberJoined(member));
@@ -438,7 +441,7 @@ fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_c
         state_changes: Vec::new(),
     };
 
-    for i in range(0, state_changes.len() + 1) {
+    for i in 0..state_changes.len() + 1 {
         message = Message {
             sender: sender.clone(),
             cluster_key: cluster_key.clone(),
@@ -494,7 +497,7 @@ fn enqueue_state_change(state_changes: &mut Vec<StateChange>, members: &[Member]
 impl Decodable for EncSocketAddr {
     fn decode<D: Decoder>(d: &mut D) -> Result<Self, D::Error> {
         match d.read_str() {
-            Ok(s) => match FromStr::from_str(s.as_slice()) {
+            Ok(s) => match FromStr::from_str(&s) {
                 Ok(addr) => Ok(EncSocketAddr(addr)),
                 Err(e) => Err(d.error(format!("{:?}", e).as_slice())),
             },

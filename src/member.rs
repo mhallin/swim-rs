@@ -3,10 +3,10 @@ use std::fmt::{Debug, Formatter};
 use std::old_io::net::ip::SocketAddr;
 use std::str::FromStr;
 use std::cmp::Ordering;
-use std::time::Duration;
 
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use time;
+use time::Duration;
 use uuid::Uuid;
 
 
@@ -112,7 +112,7 @@ impl Decodable for Member {
                 d.read_option(|d, b| {
                     if b {
                         match d.read_str() {
-                            Ok(s) => Ok(Some(FromStr::from_str(s.as_slice()).unwrap())),
+                            Ok(s) => Ok(Some(FromStr::from_str(&s).unwrap())),
                             Err(e) => Err(e),
                         }
                     }

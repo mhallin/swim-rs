@@ -1,10 +1,10 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::old_io::net::ip::SocketAddr;
-use std::time::Duration;
 
 use rand;
 use rand::Rng;
+use time::Duration;
 use uuid::Uuid;
 
 use member;

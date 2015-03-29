@@ -1,12 +1,10 @@
 #![feature(core)]
 #![feature(old_io)]
-#![feature(io)]
-#![feature(path)]
 #![feature(path_ext)]
 #![feature(plugin)]
 #![plugin(docopt_macros)]
 
-extern crate "rustc-serialize" as rustc_serialize;
+extern crate rustc_serialize;
 extern crate docopt;
 extern crate uuid;
 
@@ -37,14 +35,14 @@ fn main() {
 
     let config = swim::ClusterConfig {
         cluster_key: args.arg_cluster_key.as_bytes().to_vec(),
-        listen_addr: args.arg_listen_addr.as_slice().to_socket_addr().unwrap(),
+        listen_addr: (&args.arg_listen_addr as &str).to_socket_addr().unwrap(),
         .. Default::default()
     };
 
     let cluster = swim::start_cluster(host_key, config);
 
     if args.arg_seed_node.len() > 0 {
-        cluster.add_seed_node(args.arg_seed_node.as_slice());
+        cluster.add_seed_node(&args.arg_seed_node as &str);
     }
 
     println!("Starting event poller");
@@ -69,7 +67,7 @@ fn read_host_key(root_folder: &Path) -> Uuid {
         let mut host_key_contents = Vec::new();
         File::open(&host_key_path).unwrap().read_to_end(&mut host_key_contents).unwrap();
 
-        return Uuid::from_bytes(host_key_contents.as_slice()).unwrap();
+        return Uuid::from_bytes(&host_key_contents).unwrap();
     }
 
     let host_key = Uuid::new_v4();
