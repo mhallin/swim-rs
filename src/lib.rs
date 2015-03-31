@@ -187,8 +187,6 @@ fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<Cluster
 }
 
 fn run_udp_listen_loop(stop_signal: Arc<Mutex<bool>>, mut listener_socket: UdpSocket, listener_tx: Sender<InternalRequest>, network_mtu: usize) {
-    listener_socket.set_read_timeout(Some(100));
-
     loop {
         {
             let lock = (*stop_signal).lock().unwrap();
@@ -198,6 +196,8 @@ fn run_udp_listen_loop(stop_signal: Arc<Mutex<bool>>, mut listener_socket: UdpSo
         }
 
         let mut buf = vec![0; network_mtu];
+
+        listener_socket.set_read_timeout(Some(100));
 
         match listener_socket.recv_from(&mut buf) {
             Ok((size, src_addr)) => {
