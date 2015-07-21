@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::old_io::net::ip::SocketAddr;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::cmp::Ordering;
 
@@ -194,7 +194,7 @@ impl Debug for Member {
             (time::get_time() - self.last_state_change.to_timespec()).num_milliseconds(),
             match self.remote_host {
                 Some(host) => format!("{}", host),
-                None => String::from_str("(myself)"),
+                None => String::from("(myself)"),
             }))
     }
 }
@@ -236,7 +236,7 @@ mod test {
         };
 
         let encoded = json::encode(&member).unwrap();
-        let decoded = json::decode(&encoded).unwrap();
+        let decoded : Member = json::decode(&encoded).unwrap();
 
         assert_eq!(decoded, member);
     }

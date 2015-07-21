@@ -1,23 +1,17 @@
-#![feature(core)]
-#![feature(io)]
-#![feature(old_io)]
-#![feature(std_misc)]
-#![feature(collections)]
+#![feature(drain)]
+#![feature(convert)]
 
 extern crate rustc_serialize;
 extern crate time;
 extern crate uuid;
 extern crate rand;
+extern crate mio;
 
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
-use std::old_io::net::ip::{SocketAddr, ToSocketAddr};
-use std::old_io::net::udp::UdpSocket;
-use std::old_io::timer::Timer;
-use std::old_io::{IoError, IoErrorKind};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::default::Default;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -25,6 +19,9 @@ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_serialize::json;
 use time::Duration;
 use uuid::Uuid;
+
+use mio::udp::UdpSocket;
+use mio::buf::MutBuf;
 
 mod member;
 mod memberlist;
@@ -48,7 +45,7 @@ pub enum MemberEvent {
 
 pub struct Cluster {
     pub events: Receiver<ClusterEvent>,
-    comm: Sender<InternalRequest>,
+    comm: mio::Sender<InternalRequest>,
 }
 
 pub struct ClusterConfig {
@@ -81,6 +78,7 @@ struct TargetedRequest {
 enum InternalRequest {
     AddSeed(SocketAddr),
     Respond(SocketAddr, Message),
+    React(TargetedRequest),
     LeaveCluster,
     Exit(Sender<()>),
 }
@@ -93,8 +91,8 @@ struct State {
     pending_responses: Vec<(time::Tm, SocketAddr, Vec<StateChange>)>,
     state_changes: Vec<StateChange>,
     wait_list: WaitList,
-    socket: UdpSocket,
-    request_tx: Sender<TargetedRequest>,
+    server_socket: UdpSocket,
+    request_tx: mio::Sender<InternalRequest>,
     event_tx: Sender<ClusterEvent>,
 }
 
@@ -106,115 +104,24 @@ struct Message {
     state_changes: Vec<StateChange>,
 }
 
+const SERVER: mio::Token = mio::Token(0);
+
 pub fn start_cluster(host_key: Uuid, config: ClusterConfig) -> Cluster {
     let (event_tx, event_rx) = channel();
-    let (internal_tx, internal_rx) = channel();
 
-    let runner_tx = internal_tx.clone();
+    let (mut event_loop, mut state) = State::new(host_key, config, event_tx);
+    let internal_tx = event_loop.channel();
+
     thread::spawn(move || {
-        run_main_loop(host_key, config, event_tx, runner_tx, internal_rx);
+        event_loop.run(&mut state).unwrap();
     });
 
-    return Cluster { events: event_rx, comm: internal_tx };
-}
-
-fn run_main_loop(host_key: Uuid, config: ClusterConfig, event_tx: Sender<ClusterEvent>, internal_tx: Sender<InternalRequest>, internal_rx: Receiver<InternalRequest>) {
-    let (request_tx, request_rx) = channel();
-    let socket = UdpSocket::bind(config.listen_addr).unwrap();
-    let stop_listener_cell = Arc::new(Mutex::new(false));
-
-    let listener_tx = internal_tx.clone();
-    let listener_socket = socket.clone();
-    let network_mtu = config.network_mtu;
-    let listener_cell = stop_listener_cell.clone();
-    let listen_thread = thread::spawn(move || {
-        run_udp_listen_loop(listener_cell, listener_socket, listener_tx, network_mtu);
-    });
-
-    let me = Member::myself(host_key.clone());
-
-    let mut state = State {
-        host_key: host_key,
-        config: config,
-        members: MemberList::new(me.clone()),
-        seed_queue: Vec::new(),
-        pending_responses: Vec::new(),
-        state_changes: vec![StateChange::new(me)],
-        wait_list: HashMap::new(),
-        socket: socket,
-        request_tx: request_tx,
-        event_tx: event_tx,
-    };
-
-    let mut timer = Timer::new().unwrap();
-    let ping_interval = std::time::Duration::microseconds(
-        state.config.ping_interval.num_microseconds().unwrap());
-    let periodic = timer.periodic(ping_interval);
-
-    let mut exit_tx = None;
-
-    loop {
-        select!(
-            _ = periodic.recv() => {
-                state.enqueue_seed_nodes();
-                state.enqueue_random_ping();
-            },
-            request = request_rx.recv() => {
-                state.prune_timed_out_responses();
-                state.process_request(request.unwrap());
-            },
-            internal_message = internal_rx.recv() => {
-                exit_tx = state.process_internal_request(internal_message.unwrap());
-            }
-        );
-
-        if exit_tx.is_some() {
-            break;
-        }
-    }
-
-    {
-        let mut lock = (*stop_listener_cell).lock().unwrap();
-
-        *lock = true;
-    }
-
-    listen_thread.join().ok().unwrap();
-
-    if let Some(exit_tx) = exit_tx {
-        exit_tx.send(()).unwrap();
-    }
-}
-
-fn run_udp_listen_loop(stop_signal: Arc<Mutex<bool>>, mut listener_socket: UdpSocket, listener_tx: Sender<InternalRequest>, network_mtu: usize) {
-    loop {
-        {
-            let lock = (*stop_signal).lock().unwrap();
-            if *lock {
-                return;
-            }
-        }
-
-        let mut buf = vec![0; network_mtu];
-
-        listener_socket.set_read_timeout(Some(100));
-
-        match listener_socket.recv_from(&mut buf) {
-            Ok((size, src_addr)) => {
-                let message = json::decode(&*String::from_utf8_lossy(&buf[..size]));
-                listener_tx.send(InternalRequest::Respond(src_addr, message.unwrap())).unwrap();
-            },
-            Err(IoError { kind: IoErrorKind::TimedOut, desc: _, detail: _ }) => (),
-            Err(e) => {
-                println!("Error while reading: {:?}", e);
-            }
-        };
-    }
+    Cluster { events: event_rx, comm: internal_tx }
 }
 
 impl Cluster {
-    pub fn add_seed_node<A: ToSocketAddr>(&self, addr: A) {
-        self.comm.send(InternalRequest::AddSeed(addr.to_socket_addr().unwrap())).unwrap();
+    pub fn add_seed_node(&self, addr: SocketAddr) {
+        self.comm.send(InternalRequest::AddSeed(addr)).unwrap();
     }
 
     pub fn leave_cluster(&self) {
@@ -232,13 +139,86 @@ impl Drop for Cluster {
     }
 }
 
+impl mio::Handler for State {
+    type Timeout = ();
+    type Message = InternalRequest;
+
+    fn ready(&mut self, _event_loop: &mut mio::EventLoop<Self>, token: mio::Token, events: mio::EventSet) {
+        if events.is_readable() && token == SERVER {
+            let mut data = vec![0; self.config.network_mtu];
+            let src_addr;
+            let remaining;
+
+            {
+                let mut buf = mio::buf::MutSliceBuf::wrap(&mut data);
+                src_addr = self.server_socket.recv_from(&mut buf).unwrap();
+                remaining = buf.remaining();
+            }
+
+            let size = self.config.network_mtu - remaining;
+            let message = json::decode(&*String::from_utf8_lossy(&data[..size]));
+
+            self.request_tx.send(InternalRequest::Respond(src_addr.unwrap(), message.unwrap())).unwrap();
+        }
+    }
+
+    fn timeout(&mut self, event_loop: &mut mio::EventLoop<Self>, _timeout: Self::Timeout) {
+        self.enqueue_seed_nodes();
+        self.enqueue_random_ping();
+
+        event_loop.timeout_ms((), self.config.ping_interval.num_milliseconds() as u64).unwrap();
+    }
+
+    fn notify(&mut self, event_loop: &mut mio::EventLoop<Self>, msg: InternalRequest) {
+        let exit_tx = self.process_internal_request(msg);
+
+        if let Some(exit_tx) = exit_tx {
+            event_loop.shutdown();
+            exit_tx.send(()).unwrap();
+        }
+    }
+}
+
 impl State {
+    fn new(host_key: Uuid,
+           config: ClusterConfig,
+           event_tx: Sender<ClusterEvent>) -> (mio::EventLoop<State>, State) {
+        let mut event_loop = mio::EventLoop::new().unwrap();
+
+        let server_socket = UdpSocket::bound(&config.listen_addr).unwrap();
+
+        event_loop.register_opt(&server_socket, SERVER, mio::EventSet::all(), mio::PollOpt::edge()).unwrap();
+
+        let me = Member::myself(host_key.clone());
+
+        let state = State {
+            host_key: host_key,
+            config: config,
+            members: MemberList::new(me.clone()),
+            seed_queue: Vec::new(),
+            pending_responses: Vec::new(),
+            state_changes: vec![StateChange::new(me)],
+            wait_list: HashMap::new(),
+            server_socket: server_socket,
+            request_tx: event_loop.channel(),
+            event_tx: event_tx,
+        };
+
+        event_loop.timeout_ms((), state.config.ping_interval.num_milliseconds() as u64).unwrap();
+
+        (event_loop, state)
+    }
+
     fn process_request(&mut self, request: TargetedRequest) {
         use Request::*;
 
         let timeout = time::now_utc() + self.config.ping_timeout;
         let should_add_pending = request.request == Ping;
-        let message = build_message(&self.host_key, &self.config.cluster_key, request.request, self.state_changes.clone(), self.config.network_mtu);
+        let message = build_message(&self.host_key,
+                                    &self.config.cluster_key,
+                                    request.request,
+                                    self.state_changes.clone(),
+                                    self.config.network_mtu);
 
         if should_add_pending {
             self.pending_responses.push((timeout, request.target.clone(), message.state_changes.clone()));
@@ -248,18 +228,25 @@ impl State {
 
         assert!(encoded.len() < self.config.network_mtu);
 
-        self.socket.send_to(encoded.as_bytes(), request.target).unwrap();
+        let mut buf = mio::buf::SliceBuf::wrap(encoded.as_bytes());
+        self.server_socket.send_to(&mut buf, &request.target).unwrap();
     }
 
     fn enqueue_seed_nodes(&self) {
         for seed_node in &self.seed_queue {
-            self.request_tx.send(TargetedRequest { request: Request::Ping, target: seed_node.clone() }).unwrap();
+            self.request_tx.send(InternalRequest::React(TargetedRequest {
+                request: Request::Ping,
+                target: seed_node.clone(),
+            })).unwrap();
         }
     }
 
     fn enqueue_random_ping(&mut self) {
         if let Some(member) = self.members.next_random_member() {
-            self.request_tx.send(TargetedRequest { request: Request::Ping, target: member.remote_host().unwrap() }).unwrap();
+            self.request_tx.send(InternalRequest::React(TargetedRequest {
+                request: Request::Ping,
+                target: member.remote_host().unwrap(),
+            })).unwrap();
         }
     }
 
@@ -296,10 +283,10 @@ impl State {
     fn send_ping_requests(&self, target: &Member) {
         if let Some(target_host) = target.remote_host() {
             for relay in self.members.hosts_for_indirect_ping(self.config.ping_request_host_count, &target_host) {
-                self.request_tx.send(TargetedRequest {
+                self.request_tx.send(InternalRequest::React(TargetedRequest {
                     request: Request::PingRequest(EncSocketAddr::from_addr(&target_host)),
                     target: relay,
-                }).unwrap();
+                })).unwrap();
             }
         }
     }
@@ -310,6 +297,10 @@ impl State {
         match message {
             AddSeed(addr) => self.seed_queue.push(addr),
             Respond(src_addr, message) => self.respond_to_message(src_addr, message),
+            React(request) => {
+                self.prune_timed_out_responses();
+                self.process_request(request);
+            },
             LeaveCluster => {
                 let myself = self.members.leave();
                 enqueue_state_change(&mut self.state_changes, &[myself]);
@@ -352,7 +343,8 @@ impl State {
             };
 
             match response {
-                Some(response) => self.request_tx.send(response).unwrap(),
+                Some(response) => self.request_tx.send(
+                    InternalRequest::React(response)).unwrap(),
                 None => (),
             };
         }
@@ -420,8 +412,11 @@ impl State {
         if let Some(member) = self.members.mark_node_alive(&src_addr) {
             match self.wait_list.get_mut(&src_addr) {
                 Some(mut wait_list) => {
-                    for remote in wait_list.drain() {
-                        self.request_tx.send(TargetedRequest { request: Request::AckHost(member.clone()), target: remote }).unwrap();
+                    for remote in wait_list.drain(..) {
+                        self.request_tx.send(InternalRequest::React(TargetedRequest {
+                            request: Request::AckHost(member.clone()),
+                            target: remote
+                        })).unwrap();
                     }
                 },
                 None => ()
@@ -433,7 +428,11 @@ impl State {
     }
 }
 
-fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_changes: Vec<StateChange>, network_mtu: usize) -> Message {
+fn build_message(sender: &Uuid,
+                 cluster_key: &Vec<u8>,
+                 request: Request,
+                 state_changes: Vec<StateChange>,
+                 network_mtu: usize) -> Message {
     let mut message = Message {
         sender: sender.clone(),
         cluster_key: cluster_key.clone(),
@@ -455,7 +454,7 @@ fn build_message(sender: &Uuid, cluster_key: &Vec<u8>, request: Request, state_c
         }
     }
 
-    return message;
+    message
 }
 
 fn add_to_wait_list(wait_list: &mut WaitList, wait_addr: &SocketAddr, notify_addr: &SocketAddr) {
@@ -473,12 +472,12 @@ fn determine_member_event(member: Member) -> MemberEvent {
     use member::MemberState::*;
     use MemberEvent::*;
 
-    return match member.state() {
+    match member.state() {
         Alive => MemberWentUp(member),
         Suspect => MemberSuspectedDown(member),
         Down => MemberWentDown(member),
         Left => MemberLeft(member),
-    };
+    }
 }
 
 fn enqueue_state_change(state_changes: &mut Vec<StateChange>, members: &[Member]) {
@@ -499,7 +498,7 @@ impl Decodable for EncSocketAddr {
         match d.read_str() {
             Ok(s) => match FromStr::from_str(&s) {
                 Ok(addr) => Ok(EncSocketAddr(addr)),
-                Err(e) => Err(d.error(format!("{:?}", e).as_slice())),
+                Err(e) => Err(d.error(format!("{:?}", e).as_str())),
             },
             Err(e) => Err(e),
         }
@@ -527,7 +526,7 @@ impl Default for ClusterConfig {
             network_mtu: 512,
             ping_request_host_count: 3,
             ping_timeout: Duration::seconds(3),
-            listen_addr: "127.0.0.1:2552".to_socket_addr().unwrap(),
+            listen_addr: "127.0.0.1:2552".to_socket_addrs().unwrap().next().unwrap(),
         }
     }
 }

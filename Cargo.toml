@@ -15,8 +15,9 @@ name = "swimmer"
 
 [dependencies]
 docopt = "*"
-rustc-serialize = "*"
 docopt_macros = "*"
+rustc-serialize = "*"
 uuid = "*"
 time = "*"
 rand = "*"
+mio = "*"

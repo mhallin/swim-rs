@@ -1,6 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::old_io::net::ip::SocketAddr;
+use std::net::SocketAddr;
 
 use rand;
 use rand::Rng;
