@@ -1,7 +1,3 @@
-#![feature(path_ext)]
-#![feature(plugin)]
-#![plugin(docopt_macros)]
-
 extern crate rustc_serialize;
 extern crate docopt;
 extern crate uuid;
@@ -11,21 +7,29 @@ extern crate swim;
 use std::io::{Read, Write};
 use std::default::Default;
 use std::fs::File;
-use std::fs::PathExt;
 use std::path::Path;
 use std::net::ToSocketAddrs;
 use std::str::FromStr;
 
+use docopt::Docopt;
 use uuid::Uuid;
 
-docopt!(Args derive Debug, "
+#[derive(Debug, RustcDecodable)]
+struct Args {
+    arg_data_folder: String,
+    arg_cluster_key: String,
+    arg_listen_addr: String,
+    arg_seed_node: String,
+}
+
+const USAGE: &'static str = "
 SWIMer - Utility for testing the SWIM protocol implementation.
 
 Usage: swimmer <data-folder> <cluster-key> <listen-addr> [<seed-node>]
-");
+";
 
 fn main() {
-    let args: Args = Args::docopt().decode().unwrap_or_else(|e| e.exit());
+    let args: Args = Docopt::new(USAGE).and_then(|d| d.decode()).unwrap_or_else(|e| e.exit());
     let root_folder = Path::new(&args.arg_data_folder);
     let host_key = read_host_key(&root_folder);
 
@@ -62,9 +66,9 @@ fn main() {
 fn read_host_key(root_folder: &Path) -> Uuid {
     let host_key_path = root_folder.join("host_key");
 
-    if host_key_path.exists() {
+    if let Ok(mut config_file) = File::open(&host_key_path) {
         let mut host_key_contents = Vec::new();
-        File::open(&host_key_path).unwrap().read_to_end(&mut host_key_contents).unwrap();
+        config_file.read_to_end(&mut host_key_contents).unwrap();
 
         return Uuid::from_bytes(&host_key_contents).unwrap();
     }

@@ -1,6 +1,3 @@
-#![feature(drain)]
-#![feature(convert)]
-
 extern crate rustc_serialize;
 extern crate time;
 extern crate uuid;
@@ -412,12 +409,14 @@ impl State {
         if let Some(member) = self.members.mark_node_alive(&src_addr) {
             match self.wait_list.get_mut(&src_addr) {
                 Some(mut wait_list) => {
-                    for remote in wait_list.drain(..) {
+                    for remote in wait_list.iter() {
                         self.request_tx.send(InternalRequest::React(TargetedRequest {
                             request: Request::AckHost(member.clone()),
-                            target: remote
+                            target: *remote
                         })).unwrap();
                     }
+
+                    wait_list.clear();
                 },
                 None => ()
             };
@@ -498,7 +497,7 @@ impl Decodable for EncSocketAddr {
         match d.read_str() {
             Ok(s) => match FromStr::from_str(&s) {
                 Ok(addr) => Ok(EncSocketAddr(addr)),
-                Err(e) => Err(d.error(format!("{:?}", e).as_str())),
+                Err(e) => Err(d.error(&format!("{:?}", e))),
             },
             Err(e) => Err(e),
         }

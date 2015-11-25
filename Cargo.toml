@@ -9,13 +9,13 @@ homepage = "https://github.com/mhallin/swim-rs"
 
 [lib]
 name = "swim"
+crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "swimmer"
 
 [dependencies]
 docopt = "*"
-docopt_macros = "*"
 rustc-serialize = "*"
 uuid = "*"
 time = "*"
